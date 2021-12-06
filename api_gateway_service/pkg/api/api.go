@@ -1,0 +1,416 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/gofrs/uuid"
+	"github.com/gorilla/mux"
+)
+
+const (
+	NewsPerPage = 10
+	logfile     = "log/api_service_log.txt"
+)
+
+// Объект новости
+type News struct {
+	ID      int    `json:"ID"`      // ID новости
+	Title   string `json:"Title"`   // заголовок новости
+	Content string `json:"Content"` // содержание новости
+	PubDate string `json:"-"`       // дата публикации новости
+	PubTime int64  `json:"PubTime"` // время публикации новости
+	Link    string `json:"Link"`    // ссылка на источник
+}
+
+// Объект комментария
+type Comment struct {
+	ID            int    `json:"ID"`            // ID комментария
+	Author        string `json:"Author"`        // автор комментария
+	Content       string `json:"Content"`       // содержание комментария
+	PubTime       int64  `json:"PubTime"`       // время создания комментария
+	ParentPost    int    `json:"ParentPost"`    // ID родительской новости
+	ParentComment int    `json:"ParentComment"` // ID родительского комментария
+}
+
+// Объект пагинации
+type Paginator struct {
+	CurrentPage int
+	NewsOnPage  int
+	SumOfPages  int
+}
+
+// Объект ответа БД новостей
+type DBAnswer struct {
+	Count int
+	Posts []News
+}
+
+// Объект короткой формы новости
+type NewsShortDetailed struct {
+	PostsArr  []News
+	Paginator Paginator
+}
+
+// Объект полной формы новости
+type NewsFullDetailed struct {
+	Post        News
+	CommentsArr []Comment
+}
+
+// Программный интерфейс приложения
+type API struct {
+	r *mux.Router
+}
+
+// Конструктор объекта API
+func New() *API {
+	api := API{}
+	api.r = mux.NewRouter()
+	api.endpoints()
+	return &api
+}
+
+// Регистрация обработчиков API.
+func (api *API) endpoints() {
+
+	// вывод списка новостей
+	api.r.HandleFunc("/news/latest", api.latest).Methods(http.MethodGet)
+	// вывод отфильтрованных новостей
+	api.r.HandleFunc("/news/filter", api.filter).Methods(http.MethodGet)
+	// детальное получение новости
+	api.r.HandleFunc("/news/detailed", api.detailed).Methods(http.MethodGet)
+	// добавление комментария
+	api.r.HandleFunc("/comments/store", api.storeComment).Methods(http.MethodPost)
+	// сквозная идентификация запросов
+	api.r.Use(api.reqId)
+}
+
+// Получение маршрутизатора запросов.
+// Требуется для передачи маршрутизатора веб-серверу.
+func (api *API) Router() *mux.Router {
+	return api.r
+}
+
+// вывод страницы новостей
+// localhost:8080/news/latest?page=0
+func (api *API) latest(w http.ResponseWriter, r *http.Request) {
+	page := 0
+	pageS := r.URL.Query().Get("page")
+	if pageS != "" {
+		var err error
+		page, err = strconv.Atoi(pageS)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	rid := r.Context().Value("request_id")
+	resp, err := http.Get(fmt.Sprintf("http://localhost:8081/news/%d/%d?request_id=%s", page, NewsPerPage, rid))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("latest http.Get error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	bPosts, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("latest ReadAll error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		http.Error(w, string(bPosts), http.StatusInternalServerError)
+		return
+	}
+
+	var dba DBAnswer
+	err = json.Unmarshal(bPosts, &dba)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("latest Unmarshal error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	var answer NewsShortDetailed
+	answer.PostsArr = dba.Posts
+	answer.Paginator.NewsOnPage = NewsPerPage
+	answer.Paginator.CurrentPage = page
+	answer.Paginator.SumOfPages = int(math.Ceil(float64(dba.Count) / float64(NewsPerPage)))
+	bytes, err := json.Marshal(answer)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("latest Marshal error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Write(bytes)
+}
+
+// вывод отфильтрованных по слову [key] новостей
+// localhost:8080/news/filter?page=0&key=Rust
+func (api *API) filter(w http.ResponseWriter, r *http.Request) {
+	page := 0
+	q := r.URL.Query()
+	k := q.Get("key")
+	pageS := r.URL.Query().Get("page")
+	if pageS != "" {
+		var err error
+		page, err = strconv.Atoi(pageS)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	rid := r.Context().Value("request_id")
+	resp, err := http.Get(fmt.Sprintf("http://localhost:8081/filter/%d/%d/%s?request_id=%s", page, NewsPerPage, k, rid))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("filter http.Get error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	bPosts, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("filter ReadAll error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		http.Error(w, string(bPosts), http.StatusInternalServerError)
+		return
+	}
+
+	var dba DBAnswer
+	err = json.Unmarshal(bPosts, &dba)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("filter Unmarshal error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	var answer NewsShortDetailed
+	answer.PostsArr = dba.Posts
+	answer.Paginator.NewsOnPage = NewsPerPage
+	answer.Paginator.CurrentPage = page
+	answer.Paginator.SumOfPages = int(math.Ceil(float64(dba.Count) / float64(NewsPerPage)))
+	bytes, err := json.Marshal(answer)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("filter Marshal error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Write(bytes)
+}
+
+// Добавление комментария
+func (api *API) storeComment(w http.ResponseWriter, r *http.Request) {
+	bComment, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("APIsrv storeComment ReadAll error: %s", err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	var c Comment
+	err = json.Unmarshal(bComment, &c)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("APIsrv storeComment Unmarshal error: %s", err.Error()), http.StatusBadRequest)
+		return
+	}
+	rid := r.Context().Value("request_id")
+	censor, err := http.Post(fmt.Sprintf("http://localhost:8083/censor?request_id=%s", rid), "text", bytes.NewReader([]byte(c.Content)))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("storeComment censorPost error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	bCensor, err := io.ReadAll(censor.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("filter ReadAll error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if censor.StatusCode != 200 {
+		http.Error(w, string(bCensor), http.StatusInternalServerError)
+		return
+	}
+
+	resp, err := http.Post(fmt.Sprintf("http://localhost:8082/comments?request_id=%s", rid), "JSON", bytes.NewReader(bComment))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("storeComment http.Post error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(resp.StatusCode)
+}
+
+// детальное получение новости
+// localhost:8080/news/detailed?id=1
+func (api *API) detailed(w http.ResponseWriter, r *http.Request) {
+	id := 0
+	idS := r.URL.Query().Get("id")
+	if idS != "" {
+		var err error
+		id, err = strconv.Atoi(idS)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	rid := r.Context().Value("request_id")
+	type newsDTO struct {
+		news News
+		err  error
+	}
+	type commentsDTO struct {
+		comments []Comment
+		err      error
+	}
+
+	detailedFunc := func(ch chan newsDTO) {
+		var nDTO newsDTO
+		det, err := http.Get(fmt.Sprintf("http://localhost:8081/detailed/%d?request_id=%s", id, rid))
+		if err != nil {
+			nDTO.news = News{}
+			nDTO.err = fmt.Errorf("detailed http.Get 8081 error: %s", err)
+			ch <- nDTO
+			return
+		}
+
+		bPost, err := io.ReadAll(det.Body)
+		if err != nil {
+			nDTO.news = News{}
+			nDTO.err = fmt.Errorf("detailed ReadAll 8081 error: %s", err)
+			ch <- nDTO
+			return
+		}
+
+		if det.StatusCode != 200 {
+			nDTO.news = News{}
+			nDTO.err = fmt.Errorf("detailed !=200 8081 error: %s", string(bPost))
+			ch <- nDTO
+			return
+		}
+
+		var p News
+		err = json.Unmarshal(bPost, &p)
+		if err != nil {
+			nDTO.news = News{}
+			nDTO.err = fmt.Errorf("detailed Unmarshal 8081 error: %s", err)
+			ch <- nDTO
+			return
+		}
+		nDTO.news = p
+		nDTO.err = nil
+		ch <- nDTO
+	}
+	commentsFunc := func(ch chan commentsDTO) {
+		var cDTO commentsDTO
+		com, err := http.Get(fmt.Sprintf("http://localhost:8082/comments/%d?request_id=%s", id, rid))
+		if err != nil {
+			cDTO.comments = []Comment{}
+			cDTO.err = fmt.Errorf("detailed http.Get 8082 error: %s", err)
+			ch <- cDTO
+			return
+		}
+
+		bComms, err := io.ReadAll(com.Body)
+		if err != nil {
+			cDTO.comments = []Comment{}
+			cDTO.err = fmt.Errorf("detailed ReadAll 8082 error: %s", err)
+			ch <- cDTO
+			return
+		}
+
+		if com.StatusCode != 200 {
+			cDTO.comments = []Comment{}
+			cDTO.err = fmt.Errorf("detailed !=200 8082 error: %s", string(bComms))
+			ch <- cDTO
+			return
+		}
+
+		var c []Comment
+		err = json.Unmarshal(bComms, &c)
+		if err != nil {
+			cDTO.comments = []Comment{}
+			cDTO.err = fmt.Errorf("detailed Unmarshal 8082 error: %s", err)
+			ch <- cDTO
+			return
+		}
+		cDTO.comments = c
+		cDTO.err = nil
+		ch <- cDTO
+	}
+
+	var answer NewsFullDetailed
+	newsChan := make(chan newsDTO, 1)
+	commentsChan := make(chan commentsDTO, 1)
+	go detailedFunc(newsChan)
+	go commentsFunc(commentsChan)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case ndto := <-newsChan:
+			{
+				if ndto.err != nil {
+					http.Error(w, fmt.Sprintf("detailed newschan error: %s", ndto.err.Error()), http.StatusInternalServerError)
+					return
+				}
+				answer.Post = ndto.news
+			}
+		case cdto := <-commentsChan:
+			{
+				if cdto.err != nil {
+					http.Error(w, fmt.Sprintf("detailed commentschan error: %s", cdto.err.Error()), http.StatusInternalServerError)
+					return
+				}
+				answer.CommentsArr = cdto.comments
+			}
+		}
+	}
+	bytes, err := json.Marshal(answer)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("detailed Marshal error: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Write(bytes)
+}
+
+// сквозная идентификация запросов
+// ?request_id=112233445566
+func (api *API) reqId(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		file, err := os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0664)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("os.OpenFile error: %s", err.Error()), http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+		id := r.URL.Query().Get("request_id")
+		if id == "" {
+			uid, err := uuid.NewV4()
+			if err != nil {
+				http.Error(w, fmt.Sprintf("uuid.NewV4 error: %s", err.Error()), http.StatusInternalServerError)
+				return
+			}
+			id = uid.String()
+		}
+		ctx := context.WithValue(r.Context(), "request_id", id)
+		r = r.WithContext(ctx)
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, r)
+		for k, v := range rec.Result().Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		rec.Body.WriteTo(w)
+
+		fmt.Fprintf(file, "Request ID: %s\n", id)
+		fmt.Fprintf(file, "Time: %s\n", time.Now().Format(time.RFC1123))
+		fmt.Fprintf(file, "Remote IP: %s\n", r.RemoteAddr)
+		fmt.Fprintf(file, "HTTP Status: %d\n", rec.Result().StatusCode)
+		fmt.Fprintln(file)
+	})
+}

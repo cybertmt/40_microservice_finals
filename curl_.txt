@@ -1,0 +1,7 @@
+curl -X "POST" -d '{"Author":"Автор 1","Content":"Содержание комментария 1","PubTime":1631622203,"ParentPost":1, "ParentComment":0}' "http://127.0.0.1:8080/comments/store"
+
+curl -X "POST" -d '{"Author":"Автор 2","Content":"Содержание комментария 2","PubTime":1631622204,"ParentPost":1, "ParentComment":0}' "http://127.0.0.1:8080/comments/store"
+
+curl -X "POST" -d '{"Author":"Автор 3","Content":"Содержание комментария 3","PubTime":1631622205,"ParentPost":2, "ParentComment":0}' "http://127.0.0.1:8080/comments/store"
+
+curl -X "POST" -d '{"Author":"Автор 4","Content":"Содержание комментария 4","PubTime":1631622206,"ParentPost":3, "ParentComment":0}' "http://127.0.0.1:8080/comments/store"
